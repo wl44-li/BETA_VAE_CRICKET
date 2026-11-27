@@ -1,0 +1,4 @@
+in_dosage	--input_encoding dosage
+in_maskch	--mask_channel
+in_dosage_maskch	--input_encoding dosage --mask_channel
+lik_cat_focal2	--likelihood categorical --focal_gamma 2

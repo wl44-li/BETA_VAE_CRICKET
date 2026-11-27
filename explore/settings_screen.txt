@@ -1,0 +1,22 @@
+base	
+base_s1	--model_seed 1
+base_s2	--model_seed 2
+lik_cat	--likelihood categorical
+lik_bin	--likelihood binomial
+pca50	--encoder pca --input_pca 50
+pca200	--encoder pca --input_pca 200
+wd0.01	--weight_decay 0.01
+wd0.1	--weight_decay 0.1
+mask10	--input_mask_rate 0.1
+mask30	--input_mask_rate 0.3
+bestval	--select best_val
+drop03	--dropout 0.3
+h128_64	--hidden_dims 128,64
+h256	--hidden_dims 256
+h1024_256	--hidden_dims 1024,256
+z4	--z_dim 4
+z64	--z_dim 64
+blk50	--encoder block --block_size 50 --block_dim 4
+blk200	--encoder block --block_size 200 --block_dim 8
+blk50_dec	--encoder block --decoder block --block_size 50 --block_dim 4
+conv	--encoder conv

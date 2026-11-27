@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import random
+import time
 from dataclasses import asdict
 
 import numpy as np
@@ -128,14 +129,34 @@ def parse_args():
 
     parser.add_argument("--n_splits", type=int, default=5)
     parser.add_argument("--inner_val_fraction", type=float, default=0.125)
-    parser.add_argument("--seed", type=int, default=1024)
+    parser.add_argument("--seed", type=int, default=1024,
+                        help="Seed of the folds (and of the model when --model_seed is not given).")
+    parser.add_argument("--model_seed", type=int, default=None,
+                        help="Seed of the model initialisation and training; the folds stay with --seed.")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--max_epochs", type=int, default=400)
+    parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--device", default=None)
 
     # Model.
     parser.add_argument("--z_dim", type=int, default=16)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--hidden_dims", default="512,128",
+                        help="Widths of the encoder MLP (the decoder mirrors them).")
+    parser.add_argument("--likelihood", choices=["bernoulli2", "categorical", "binomial"],
+                        default="bernoulli2")
+    parser.add_argument("--encoder", choices=["mlp", "pca", "block", "conv"], default="mlp")
+    parser.add_argument("--decoder", choices=["mlp", "block"], default="mlp")
+    parser.add_argument("--input_pca", type=int, default=50)
+    parser.add_argument("--block_size", type=int, default=50)
+    parser.add_argument("--block_dim", type=int, default=4)
+    parser.add_argument("--input_encoding", choices=["channels", "dosage"], default="channels")
+    parser.add_argument("--mask_channel", action="store_true")
+
+    # Regularisation.
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--input_mask_rate", type=float, default=0.0)
+    parser.add_argument("--focal_gamma", type=float, default=0.0)
 
     # Loss weights.
     parser.add_argument("--beta", type=float, default=16.0,
@@ -152,7 +173,9 @@ def parse_args():
 
 
 def main(args):
-    set_seed(args.seed)
+    model_seed = args.seed if args.model_seed is None else args.model_seed
+
+    set_seed(model_seed)
     os.makedirs(args.save_dir, exist_ok=True)
 
     data_cfg = DataConfig(
@@ -168,15 +191,28 @@ def main(args):
     model_cfg = ModelConfig(
         z_dim=args.z_dim,
         dropout=args.dropout,
+        hidden_dims=tuple(int(width) for width in args.hidden_dims.split(",")),
+        likelihood=args.likelihood,
+        encoder=args.encoder,
+        decoder=args.decoder,
+        input_pca=args.input_pca,
+        block_size=args.block_size,
+        block_dim=args.block_dim,
+        input_encoding=args.input_encoding,
+        mask_channel=args.mask_channel,
     )
 
     train_cfg = TrainConfig(
         batch_size=args.batch_size,
         max_epochs=args.max_epochs,
+        lr=args.lr,
         beta=args.beta,
         capacity_z=args.capacity_z,
         beta_warmup_epochs=args.beta_warmup_epochs,
         select=args.select,
+        weight_decay=args.weight_decay,
+        input_mask_rate=args.input_mask_rate,
+        focal_gamma=args.focal_gamma,
     )
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -187,6 +223,7 @@ def main(args):
             "model": asdict(model_cfg),
             "training": asdict(train_cfg),
             "device": device,
+            "model_seed": model_seed,
             "downstream": {
                 "classifier": "StandardScaler + LogisticRegression",
                 "C": 1.0,
@@ -229,12 +266,14 @@ def main(args):
         save_json(data.block_info, os.path.join(fold_dir, "block_info.json"))
 
         # Start each fold with the same seed and a fresh model and optimizer.
-        set_seed(args.seed)
+        set_seed(model_seed)
 
         model = BetaVAE(data.input_dim, model_cfg)
         trainer = BetaVAETrainer(model=model, cfg=train_cfg, device=device)
 
+        fit_start = time.time()
         trainer.fit(data.x_train, data.x_val)
+        fit_seconds = time.time() - fit_start
         trainer.restore_best_model()
 
         history = pd.DataFrame(trainer.history)
@@ -253,8 +292,13 @@ def main(args):
             "fold_id": fold_id,
             "best_epoch": trainer.best_epoch,
             "best_val_loss": trainer.best_val_loss,
+            "n_snps_used": data.x_train.shape[1],
+            "fit_seconds": fit_seconds,
             **trainer.evaluate(data.x_test),
-            **{f"val_{name}": value for name, value in trainer.evaluate(data.x_val).items()},
+            **{
+                f"val_{name}": value
+                for name, value in trainer.evaluate(data.x_val).items()
+            },
         }
 
         vae_rows.append(vae_row)
@@ -263,7 +307,7 @@ def main(args):
         latents = export_latents(data, trainer, fold_dir)
 
         # From here on labels are used; the model is no longer changed.
-        features = build_features(data, latents, seed=args.seed + fold_id, n_draws=args.n_draws)
+        features = build_features(data, latents, seed=model_seed + fold_id, n_draws=args.n_draws)
 
         test_results.append(evaluate_downstream(data, features, fold_id, fold_dir, "test"))
         val_results.append(evaluate_downstream(data, features, fold_id, fold_dir, "val"))

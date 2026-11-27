@@ -8,7 +8,14 @@ import torch
 import torch.nn.functional as F
 from torch.optim import Adam, AdamW
 
-from losses import beta_vae_objective, capacity, kl_gaussian, reconstruction_loss
+from losses import (
+    MISSING,
+    beta_vae_objective,
+    capacity,
+    kl_gaussian,
+    predicted_genotype,
+    reconstruction_loss,
+)
 from model import encode_genotype
 
 
@@ -30,6 +37,13 @@ class TrainConfig:
     # "last": the model after the last epoch.
     # "best_val": lowest validation loss among the epochs after the warm-up and the ramp.
     select: str = "last"
+
+    # Share of the observed SNPs hidden from the encoder at every training step (the loss still
+    # covers them). 0: off.
+    input_mask_rate: float = 0.0
+
+    # Focal loss exponent for the categorical likelihood, training loss only. 0: off.
+    focal_gamma: float = 0.0
 
     verbose: bool = True
     log_every: int = 50
@@ -68,15 +82,24 @@ class BetaVAETrainer:
         self.best_epoch = None
         self.best_state_dict = None
         self.reference = None
+        self.common_genotype = None
+        self.likelihood = model.cfg.likelihood
 
     def _tensor(self, dosage):
         return torch.as_tensor(np.asarray(dosage), dtype=torch.uint8, device=self.device)
 
-    def _forward_losses(self, dosage, sample, beta, capacity_z):
+    def _forward_losses(self, dosage, sample, beta, capacity_z, input_mask_rate=0.0, focal_gamma=0.0):
         x, mask = encode_genotype(dosage)
-        recon_logits, mu, logvar = self.model(x, mask, sample=sample)
+        encoder_mask = mask
 
-        loss_recon = reconstruction_loss(recon_logits, x, mask).mean()
+        if input_mask_rate > 0:
+            hidden = torch.rand(dosage.shape, device=dosage.device) < input_mask_rate
+            encoder_mask = mask * (~hidden).repeat_interleave(2, dim=1)
+
+        recon_logits, mu, logvar = self.model(x, encoder_mask, sample=sample)
+
+        loss_recon = reconstruction_loss(
+            recon_logits, x, mask, dosage, self.likelihood, focal_gamma).mean()
         loss_kl = kl_gaussian(mu, logvar).sum(-1).mean()
 
         loss = beta_vae_objective(loss_recon, loss_kl, beta, capacity_z)
@@ -107,6 +130,9 @@ class BetaVAETrainer:
         """Train on x_train. x_val is only used to follow (and optionally select by) its loss."""
         cfg = self.cfg
 
+        if cfg.focal_gamma > 0 and self.likelihood != "categorical":
+            raise ValueError("focal_gamma needs the categorical likelihood.")
+
         if cfg.select not in ("last", "best_val"):
             raise ValueError("select must be 'last' or 'best_val'.")
 
@@ -119,10 +145,20 @@ class BetaVAETrainer:
         # Allele-frequency information of the training crickets only.
         x, mask = encode_genotype(train)
         feature_mean = x.sum(0) / mask.sum(0).clamp_min(1)
+
+        counts = torch.stack([(train == g).sum(0) for g in range(3)], dim=-1).to(torch.float32)
+        genotype_frequency = (counts + 0.5) / (counts.sum(-1, keepdim=True) + 1.5)
+        allele_frequency = (counts[:, 1] + 2 * counts[:, 2] + 0.5) / (2 * counts.sum(-1) + 1.0)
+
+        self.model.set_data_stats(feature_mean, genotype_frequency, allele_frequency)
+
+        if self.model.cfg.encoder == "pca":
+            self.model.fit_input_pca(x, mask)
+
         del x, mask
 
-        self.model.set_data_stats(feature_mean)
         self.reference = feature_mean.clamp(1e-4, 1 - 1e-4)
+        self.common_genotype = counts.argmax(-1)
 
         n_train = train.shape[0]
         steps_per_epoch = math.ceil(n_train / cfg.batch_size)
@@ -155,6 +191,8 @@ class BetaVAETrainer:
                     sample=True,
                     beta=beta,
                     capacity_z=capacity(step, ramp_steps, cfg.capacity_z),
+                    input_mask_rate=cfg.input_mask_rate,
+                    focal_gamma=cfg.focal_gamma,
                 )
 
                 self.optimizer.zero_grad(set_to_none=True)
@@ -243,13 +281,20 @@ class BetaVAETrainer:
         self.model.eval()
 
         recon, n_observed, reference, kl = [], [], [], []
+        correct, correct_common, n_calls = 0.0, 0.0, 0.0
 
         for start in range(0, dosage.shape[0], batch_size):
-            x_batch, mask = encode_genotype(dosage[start:start + batch_size])
+            batch = dosage[start:start + batch_size]
+            x_batch, mask = encode_genotype(batch)
             recon_logits, mu, logvar = self.model(x_batch, mask, sample=False)
 
-            recon.append(reconstruction_loss(recon_logits, x_batch, mask))
+            recon.append(reconstruction_loss(recon_logits, x_batch, mask, batch, self.likelihood))
             n_observed.append(mask.sum(-1))
+
+            observed = batch != MISSING
+            correct += ((predicted_genotype(recon_logits, self.likelihood) == batch) & observed).sum().item()
+            correct_common += ((self.common_genotype == batch) & observed).sum().item()
+            n_calls += observed.sum().item()
             reference.append(
                 (
                     F.binary_cross_entropy(
@@ -271,6 +316,11 @@ class BetaVAETrainer:
             # only knows the training allele frequencies.
             "recon_per_feature": (recon / n_observed).mean().item(),
             "allele_frequency_recon_per_feature": (reference / n_observed).mean().item(),
+            # Negative log-likelihood per observed SNP (comparable within one likelihood only)
+            # and the share of calls reconstructed exactly (comparable across likelihoods).
+            "recon_per_snp": (2 * recon / n_observed).mean().item(),
+            "concordance": correct / max(n_calls, 1.0),
+            "common_genotype_concordance": correct_common / max(n_calls, 1.0),
             "n_active_z": int((kl.mean(0) > 0.01).sum().item()),
         })
 

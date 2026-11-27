@@ -1,0 +1,2 @@
+none_z16_h512x128_b1	--model_seed 0
+none_z16_h512x128_b1_bs128_lr2e-3	--model_seed 0 --batch_size 128 --lr 2e-3
